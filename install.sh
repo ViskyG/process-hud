@@ -53,6 +53,7 @@ mkdir -p "$BASE/examples" "$BASE/docs" "$BASE/scripts"
 cp -a -- "$HERE/examples/." "$BASE/examples/"
 cp -a -- "$HERE/docs/." "$BASE/docs/"
 cp -- "$HERE/scripts/gnome_shortcut.py" "$BASE/scripts/gnome_shortcut.py"
+cp -- "$HERE/scripts/install_codex_bridge.py" "$BASE/scripts/install_codex_bridge.py"
 cp -- "$HERE/uninstall.sh" "$BASE/uninstall.sh"
 printf '%s\n' 'process-hud-owned-install-v1' > "$BASE/.process-hud-install"
 if [[ $MODE == ui ]]; then
