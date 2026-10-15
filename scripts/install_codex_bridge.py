@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 
 
 def mask_comments(text):
@@ -21,15 +22,55 @@ def mask_comments(text):
                   ''.join('\n' if c == '\n' else ' ' for c in m[0]), text)
 
 
-def setting(text, value):
+def cli_setting(text):
+    """Validate JSONC and locate only a top-level cliExecutable value.
+
+    Keep offsets intact so updating one value preserves comments and unrelated
+    settings, including similarly named keys inside nested extension objects.
+    """
     masked = mask_comments(text)
-    pattern = r'"chatgpt\.cliExecutable"\s*:\s*("(?:\\.|[^"\\])*"|null)'
-    matches = list(re.finditer(pattern, masked))
+    # VS Code accepts trailing commas. Mask them outside strings, preserving
+    # offsets in the original text just as mask_comments does.
+    pattern = r'"(?:\\.|[^"\\])*"|,\s*(?=[}\]])'
+    masked = re.sub(pattern, lambda m: m[0] if m[0].startswith('"') else
+                    ' '+m[0][1:], masked)
+    document = json.loads(masked)
+    if not isinstance(document, dict):
+        raise ValueError('VS Code settings must be a JSONC object')
+    decoder = json.JSONDecoder()
+    pos = masked.find('{')+1
+    matches = []
+    while True:
+        while masked[pos].isspace():
+            pos += 1
+        if masked[pos] == '}':
+            break
+        key, pos = decoder.raw_decode(masked, pos)
+        while masked[pos].isspace():
+            pos += 1
+        pos += 1  # The colon has already been validated by json.loads.
+        while masked[pos].isspace():
+            pos += 1
+        start = pos
+        value, pos = decoder.raw_decode(masked, pos)
+        if key == 'chatgpt.cliExecutable':
+            matches.append((start, pos, value))
+        while masked[pos].isspace():
+            pos += 1
+        if masked[pos] == ',':
+            pos += 1
     if len(matches) > 1:
         raise ValueError('Duplicate cliExecutable settings; resolve before installing')
-    if matches:
-        match = matches[0]
-        return text[:match.start(1)]+json.dumps(value)+text[match.end(1):]
+    if matches and matches[0][2] is not None and not isinstance(matches[0][2], str):
+        raise ValueError('chatgpt.cliExecutable must be a string or null; review the setting')
+    return masked, matches[0] if matches else None
+
+
+def setting(text, value):
+    masked, match = cli_setting(text)
+    if match:
+        start, end, _ = match
+        return text[:start]+json.dumps(value)+text[end:]
     opening = masked.find('{')
     if opening < 0:
         raise ValueError('No settings JSON object')
@@ -40,12 +81,8 @@ def setting(text, value):
 
 def current_cli_executable(text):
     """Read the VS Code setting without losing comments or guessing its value."""
-    masked = mask_comments(text)
-    pattern = r'"chatgpt\.cliExecutable"\s*:\s*("(?:\\.|[^"\\])*"|null)'
-    matches = list(re.finditer(pattern, masked))
-    if len(matches) > 1:
-        raise ValueError('Duplicate cliExecutable settings; resolve before installing')
-    return json.loads(matches[0].group(1)) if matches else None
+    _, match = cli_setting(text)
+    return match[2] if match else None
 
 
 def main():
@@ -58,6 +95,8 @@ def main():
     python = venv/'bin/python'
     if not (base/'.process-hud-install').is_file() or not python.is_file():
         raise ValueError('Install Process HUD normally first')
+    if (base/'.process-hud-install').read_text().strip() != 'process-hud-owned-install-v1':
+        raise ValueError('Unrecognized Process HUD installation marker')
     site = Path(subprocess.check_output([str(python), '-c',
                 'import process_hud;print(process_hud.__path__[0])'], text=True).strip())
     extensions = Path.home()/'.vscode/extensions'
@@ -75,14 +114,27 @@ def main():
     if existing is not None and existing != str(wrapper):
         raise ValueError('chatgpt.cliExecutable already points to another executable; review it before replacing')
     config_file = base/'codex-bridge.json'
+    wrapper_text = '#!'+str(python)+'\nfrom process_hud.codex_bridge import main\nraise SystemExit(main())\n'
     if existing == str(wrapper) and wrapper.is_file() and config_file.is_file():
+        if wrapper.read_text() != wrapper_text or not os.access(wrapper, os.X_OK):
+            raise ValueError('Configured bridge wrapper is modified or not executable; review before repairing')
+        config = json.loads(config_file.read_text())
+        if not isinstance(config, dict) or not isinstance(config.get('real_binary'), str):
+            raise ValueError('Configured bridge binary is missing or invalid; review before repairing')
+        if config.get('extension_root') not in (None, str(extensions)):
+            raise ValueError('Configured bridge uses a different extension root; review before repairing')
+        # The relay follows the active extension after VS Code updates it. Its
+        # saved original binary may have been removed during that normal update.
+        effective_binary = real if config.get('extension_root') == str(extensions) else Path(config['real_binary'])
+        if not effective_binary.is_file() or effective_binary.resolve() == wrapper.resolve():
+            raise ValueError('Configured bridge binary is missing or invalid; review before repairing')
         print(json.dumps({'status': 'already_configured', 'installed': str(wrapper),
                           'reload_required': False,
                           'note': 'Verify the current conversation has a live relay before --resume-codex'},
                          indent=2))
         return
     updated = setting(original, str(wrapper))
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+uuid.uuid4().hex[:8]
     backup = base/'bridge-backups'/stamp
     backup.mkdir(parents=True, mode=0o700)
     source_modules = source/'src/process_hud'
@@ -116,11 +168,12 @@ def main():
     skill.parent.mkdir(parents=True, exist_ok=True)
     if skill_source.resolve() != skill.resolve():
         shutil.copy2(skill_source, skill)
-    wrapper.write_text('#!'+str(python)+'\nfrom process_hud.codex_bridge import main\nraise SystemExit(main())\n')
+    wrapper.write_text(wrapper_text)
     wrapper.chmod(0o755)
     (base/'codex-bridge.json').write_text(json.dumps({'real_binary': str(real),
                                                   'extension_root': str(extensions)}, indent=2)+'\n')
     (base/'codex-bridge.json').chmod(0o600)
+    settings.parent.mkdir(parents=True, exist_ok=True)
     tmp = settings.with_name('settings.json.hud-new')
     tmp.write_text(updated)
     tmp.chmod(settings.stat().st_mode & 0o777 if settings.exists() else 0o600)

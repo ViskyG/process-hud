@@ -43,7 +43,7 @@ A failure is a result, too. The bridge can bring Codex back for a non-zero exit 
 
 ### Why it matters for quota usage
 
-In [JetBrains' Benjamin-Plus analysis](https://github.com/JetBrains/benjamin-plus-skill/blob/main/EXPECTED-RESULTS.md), **45.8% of agent steps in one studied Java SWE-bench configuration were polling steps**, including 3,982 checks made less than five seconds apart. That is a share of *steps*, not a universal percentage of tokens or quota spent polling. It nevertheless shows how much agent activity can go into checking status rather than solving the task.
+In [JetBrains' Benjamin-Plus analysis](https://github.com/JetBrains/benjamin-plus-skill/blob/main/EXPECTED-RESULTS.md), **45.8% of agent steps in one studied Java SWE-bench configuration were polling steps**, including 3,982 polls with wait yields below five seconds. That is a share of *steps*, not a universal percentage of tokens or quota spent polling. It nevertheless shows how much agent activity can go into checking status rather than solving the task.
 
 We also tested Process HUD itself. Across two live 120-second waiting scenarios — a normal Codex conversation and a subagent returning to its root agent — the waiting conversations made **0 new model turns and recorded 0 token-counter updates**. Completion reached the intended conversations. Success, errors, and interruptions were tested separately.
 
@@ -101,6 +101,8 @@ This installs HUD and the Codex skill at `~/.agents/skills/process-hud`. The bri
 ```
 
 If newly configured, reload VS Code once. The script leaves an existing working configuration alone and does not silently replace an unrelated `chatgpt.cliExecutable` setting. The bridge will not be ready for the *current* conversation until it is running and the connection is verified.
+
+These commands use the default installation paths, required by the current bridge installer. `doctor` is a diagnostic report, not an end-to-end test. If `process-hud` is missing from `PATH`, use `~/.local/bin/process-hud`.
 
 To see the UI and try a normal background job:
 

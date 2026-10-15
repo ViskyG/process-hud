@@ -29,6 +29,9 @@ Verify installation with `command -v process-hud` once when needed. The default
 installed path is `$HOME/.local/bin/process-hud`. Use `process-hud doctor` for a
 specific installation problem, not as a ritual before every task. Do not repeatedly
 reinstall dependencies. Read `process-hud <command> --help` when a flag is uncertain.
+If the executable is absent from `PATH`, use its installed absolute path for all
+examples below. A zero `doctor` exit code only means the report was produced;
+inspect the reported components and verify the required UI/bridge separately.
 
 ### First use: connect the completion bridge if needed
 
@@ -57,6 +60,8 @@ modify an already-running App Server. If newly configured, tell the user that VS
 Code must reload its window **once**; do not claim event-driven continuation is
 available until the live-bridge check succeeds in the reloaded conversation.
 Do **not** reinstall HUD or repeat configuration for every Codex session.
+The setup script currently supports default HUD and VS Code directories only;
+do not run it against a custom install root as if it supported that layout.
 
 If the installed setup script is absent (an older HUD version), locate the
 existing repository and follow `docs/INSTALL_FOR_CODEX.md` to upgrade safely; do

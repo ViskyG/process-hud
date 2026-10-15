@@ -6,7 +6,9 @@ Your goal is to let Codex delegate long-running noninteractive commands to Proce
 
 ## 1. Check the existing installation first
 
-Use the current user's permitted environment. Check whether `~/.local/bin/process-hud` exists, whether it passes `doctor`, and whether `~/.agents/skills/process-hud/SKILL.md` is installed. If these checks succeed, **do not reinstall** just because this is a different agent or project.
+Use the current user's permitted environment. Check whether `~/.local/bin/process-hud` exists, inspect its `doctor` report, and check whether `~/.agents/skills/process-hud/SKILL.md` is installed. If the required components are available, **do not reinstall** just because this is a different agent or project.
+
+`doctor` prints diagnostic information; exit code zero does not certify that the UI or callback works. For a graphical installation, check `pyside6: true` and actually open the window in a desktop session. Missing optional tools such as `kubectl` do not prevent local jobs. If `process-hud` is not on `PATH`, use `~/.local/bin/process-hud` for every command below.
 
 Never terminate someone else's workload to install or upgrade HUD. The installer intentionally refuses to replace active observers. Do not bypass sandbox, tool-approval, or filesystem permission rules.
 
@@ -20,6 +22,8 @@ bash install.sh
 ```
 
 The supported host for the graphical UI is Linux (tested on Ubuntu 24.04 GNOME/X11), Python 3.10+ and `venv`. If cloning a private repository fails, ask for access or a local checkout; never invent an alternative source. The installer creates a user-local venv and installs the skill, without enabling background workload autostart.
+
+The paths below assume the default installation. The VS Code bridge installer currently requires `~/.local/share/process-hud` and standard VS Code directories; custom install roots and a different `XDG_DATA_HOME` are not supported by that installer.
 
 ## 2. Set up event-driven continuation only when needed
 

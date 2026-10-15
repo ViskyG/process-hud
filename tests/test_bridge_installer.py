@@ -103,3 +103,97 @@ def test_jsonc_setting_parser_ignores_commented_out_values():
               ' "chatgpt.cliExecutable": "/the/actual/binary"\n}')
     assert installer.current_cli_executable(sample) == "/the/actual/binary"
     assert installer.current_cli_executable('{}') is None
+
+
+def test_jsonc_nested_setting_is_preserved_and_root_setting_is_added():
+    installer = load_installer(SOURCE)
+    sample = '{"extension.data": {"chatgpt.cliExecutable": "/nested"}}'
+    assert installer.current_cli_executable(sample) is None
+    updated = json.loads(installer.setting(sample, '/wrapper'))
+    assert updated['extension.data']['chatgpt.cliExecutable'] == '/nested'
+    assert updated['chatgpt.cliExecutable'] == '/wrapper'
+
+
+@pytest.mark.parametrize('value', ['false', '17', '[]', '{}'])
+def test_jsonc_wrong_setting_type_is_refused(value):
+    installer = load_installer(SOURCE)
+    sample = '{"chatgpt.cliExecutable": '+value+'}'
+    with pytest.raises(ValueError, match='string or null'):
+        installer.setting(sample, '/wrapper')
+
+
+@pytest.mark.parametrize('sample', ['{"editor.fontSize": 14, broken }', '[]',
+                                   '{"chatgpt.cliExecutable": null,"chatgpt.cliExecutable": "/second"}'])
+def test_invalid_or_duplicate_jsonc_is_refused(sample):
+    installer = load_installer(SOURCE)
+    with pytest.raises(ValueError):
+        installer.setting(sample, '/wrapper')
+
+
+def test_jsonc_comments_trailing_commas_and_escaped_keys():
+    installer = load_installer(SOURCE)
+    sample = ('{ /* keep */ "extension.data": {"items": [1, 2,],},\n'
+              ' "chatgpt.cli\\u0045xecutable": null, // keep too\n}')
+    updated = installer.setting(sample, '/wrapper')
+    assert '/* keep */' in updated and '// keep too' in updated
+    assert installer.current_cli_executable(updated) == '/wrapper'
+    assert updated.count('cli\\u0045xecutable') == 1
+
+
+def test_first_use_creates_missing_settings_directory(tmp_path, monkeypatch, capsys):
+    installer, base, settings, _ = fixture_installation(tmp_path, monkeypatch)
+    shutil.rmtree(settings.parent)
+    installer.main()
+    assert json.loads(capsys.readouterr().out)['status'] == 'configured'
+    assert settings.is_file()
+
+
+@pytest.mark.parametrize('damage', ['config-json', 'binary', 'wrapper', 'permissions', 'marker'])
+def test_ensure_does_not_report_damaged_installation_as_ready(tmp_path, monkeypatch, capsys, damage):
+    installer, base, settings, _ = fixture_installation(tmp_path, monkeypatch)
+    installer.main()
+    capsys.readouterr()
+    if damage == 'config-json':
+        (base/'codex-bridge.json').write_text('{broken}')
+    elif damage == 'binary':
+        (base/'codex-bridge.json').write_text('{"real_binary": "/missing/codex"}')
+    elif damage == 'wrapper':
+        (base/'venv/bin/process-hud-codex').write_text('#!/bin/sh\nexit 0\n')
+    elif damage == 'permissions':
+        (base/'venv/bin/process-hud-codex').chmod(0o600)
+    else:
+        (base/'.process-hud-install').write_text('unrelated installation')
+    before = settings.read_bytes()
+    with pytest.raises(ValueError):
+        installer.main()
+    assert settings.read_bytes() == before
+    assert len(list((base/'bridge-backups').iterdir())) == 1
+
+
+def test_backup_manifest_can_restore_the_previous_files(tmp_path, monkeypatch, capsys):
+    installer, base, settings, skill = fixture_installation(tmp_path, monkeypatch)
+    settings_before, skill_before = settings.read_bytes(), skill.read_bytes()
+    installer.main()
+    backup = Path(json.loads(capsys.readouterr().out)['backup'])
+    for entry in json.loads((backup/'manifest.json').read_text()):
+        target = Path(entry['target'])
+        if entry['backup'] is None:
+            target.unlink()
+        else:
+            shutil.copy2(backup/entry['backup'], target)
+    assert settings.read_bytes() == settings_before
+    assert skill.read_bytes() == skill_before
+    assert not (base/'codex-bridge.json').exists()
+    assert not (base/'venv/bin/process-hud-codex').exists()
+
+
+def test_ensure_follows_active_extension_after_update(tmp_path, monkeypatch, capsys):
+    installer, base, settings, _ = fixture_installation(tmp_path, monkeypatch)
+    installer.main()
+    capsys.readouterr()
+    config_file = base/'codex-bridge.json'
+    config = json.loads(config_file.read_text())
+    config['real_binary'] = '/removed/previous-extension/codex'
+    config_file.write_text(json.dumps(config))
+    installer.main()
+    assert json.loads(capsys.readouterr().out)['status'] == 'already_configured'
