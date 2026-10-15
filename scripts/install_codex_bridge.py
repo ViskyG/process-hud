@@ -38,7 +38,19 @@ def setting(text, value):
     return text[:opening+1]+'\n  "chatgpt.cliExecutable": '+json.dumps(value)+comma+text[opening+1:]
 
 
+def current_cli_executable(text):
+    """Read the VS Code setting without losing comments or guessing its value."""
+    masked = mask_comments(text)
+    pattern = r'"chatgpt\\.cliExecutable"\\s*:\\s*("(?:\\\\.|[^"\\\\])*"|null)'
+    matches = list(re.finditer(pattern, masked))
+    if len(matches) > 1:
+        raise ValueError('Duplicate cliExecutable settings; resolve before installing')
+    return json.loads(matches[0].group(1)) if matches else None
+
+
 def main():
+    if sys.argv[1:] not in ([], ['--ensure']):
+        raise ValueError('Usage: install_codex_bridge.py [--ensure]')
     os.umask(0o077)
     source = Path(__file__).resolve().parents[1]
     base = Path.home()/'.local/share/process-hud'
@@ -59,11 +71,34 @@ def main():
     settings = Path.home()/'.config/Code/User/settings.json'
     original = settings.read_text() if settings.exists() else '{}\n'
     wrapper = venv/'bin/process-hud-codex'
+    existing = current_cli_executable(original)
+    if existing is not None and existing != str(wrapper):
+        raise ValueError('chatgpt.cliExecutable already points to another executable; review it before replacing')
+    config_file = base/'codex-bridge.json'
+    if existing == str(wrapper) and wrapper.is_file() and config_file.is_file():
+        print(json.dumps({'status': 'already_configured', 'installed': str(wrapper),
+                          'reload_required': False,
+                          'note': 'Verify the current conversation has a live relay before --resume-codex'},
+                         indent=2))
+        return
     updated = setting(original, str(wrapper))
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     backup = base/'bridge-backups'/stamp
     backup.mkdir(parents=True, mode=0o700)
-    modules = sorted((source/'src/process_hud').glob('*.py'))
+    source_modules = source/'src/process_hud'
+    if source_modules.is_dir():
+        modules = sorted(source_modules.glob('*.py'))
+    elif source == base:
+        # First-use setup from the installed scripts directory: package modules
+        # are already present in the installed venv, no source tree is needed.
+        modules = []
+    else:
+        raise ValueError('Missing process_hud sources in checkout')
+    skill_source = source/'skills/process-hud/SKILL.md'
+    if not skill_source.is_file():
+        skill_source = Path.home()/'.agents/skills/process-hud/SKILL.md'
+    if not skill_source.is_file():
+        raise ValueError('Install the Process HUD skill before the bridge')
     targets = [site/module.name for module in modules]
     skill = Path.home()/'.agents/skills/process-hud/SKILL.md'
     targets += [settings, wrapper, base/'codex-bridge.json', skill]
@@ -79,7 +114,8 @@ def main():
         shutil.copy2(source/'src/process_hud'/target.name, tmp)
         os.replace(tmp, target)
     skill.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source/'skills/process-hud/SKILL.md', skill)
+    if skill_source.resolve() != skill.resolve():
+        shutil.copy2(skill_source, skill)
     wrapper.write_text('#!'+str(python)+'\nfrom process_hud.codex_bridge import main\nraise SystemExit(main())\n')
     wrapper.chmod(0o755)
     (base/'codex-bridge.json').write_text(json.dumps({'real_binary': str(real),
@@ -89,7 +125,7 @@ def main():
     tmp.write_text(updated)
     tmp.chmod(settings.stat().st_mode & 0o777 if settings.exists() else 0o600)
     os.replace(tmp, settings)
-    print(json.dumps({'installed': str(wrapper), 'backup': str(backup),
+    print(json.dumps({'status': 'configured', 'installed': str(wrapper), 'backup': str(backup),
                       'real_binary': str(real), 'reload_required': True}, indent=2))
 
 
