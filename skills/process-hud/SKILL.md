@@ -30,6 +30,47 @@ installed path is `$HOME/.local/bin/process-hud`. Use `process-hud doctor` for a
 specific installation problem, not as a ritual before every task. Do not repeatedly
 reinstall dependencies. Read `process-hud <command> --help` when a flag is uncertain.
 
+### First use: connect the completion bridge if needed
+
+This is **one per-user installation**, not a per-agent or per-project setup. Before
+the first long-running job that needs automatic Codex continuation, verify that
+**this conversation** has a live bridge, without polling a workload:
+
+```bash
+~/.local/share/process-hud/venv/bin/python -c 'from process_hud.codex_bridge import current_origin; print(current_origin()["thread_id"])'
+```
+
+If it succeeds, proceed with `--resume-codex`; there is nothing to install or
+bind manually. The bridge identifies the originating thread, and for subagents its
+root owner, from trusted Codex metadata.
+
+If no live bridge is found **and this is Codex in VS Code on Linux x86_64**, set
+up the bridge once, using the installer shipped with HUD:
+
+```bash
+~/.local/share/process-hud/venv/bin/python ~/.local/share/process-hud/scripts/install_codex_bridge.py --ensure
+```
+
+This checks for an existing VS Code integration, preserves backups, and refuses to
+overwrite an unrelated `chatgpt.cliExecutable`. It does not restart VS Code or
+modify an already-running App Server. If newly configured, tell the user that VS
+Code must reload its window **once**; do not claim event-driven continuation is
+available until the live-bridge check succeeds in the reloaded conversation.
+Do **not** reinstall HUD or repeat configuration for every Codex session.
+
+If the installed setup script is absent (an older HUD version), locate the
+existing repository and follow `docs/INSTALL_FOR_CODEX.md` to upgrade safely; do
+not copy scripts from untrusted locations. If the client is terminal Codex CLI,
+this release can register/monitor its tasks but has no verified automatic CLI
+resume integration. Do not present manual monitoring as an automatic callback.
+
+The user requesting event-driven HUD use authorizes using its normal first-use
+setup path, subject to the agent's normal filesystem/edit approvals. If the
+installation would replace a conflicting setting or needs a window reload, explain
+the required action. **Never launch with `--resume-codex` before a real live
+bridge is verified**, and never start a task with a promise of automatic wakeup
+that cannot yet be fulfilled.
+
 ## Managed local launch
 
 Choose a readable short title and an operation-specific idempotency key. Return the
