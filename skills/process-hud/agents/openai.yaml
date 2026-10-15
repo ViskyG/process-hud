@@ -1,0 +1,6 @@
+interface:
+  display_name: "Process HUD"
+  short_description: "Background jobs with a visible HUD, without model polling"
+  default_prompt: "Use $process-hud for this long-running background job and return its task ID."
+policy:
+  allow_implicit_invocation: true

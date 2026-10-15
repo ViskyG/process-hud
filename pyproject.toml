@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "process-hud"
+version = "0.1.0"
+description = "Local, model-free background job monitor with a minimal transparent desktop HUD"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["psutil>=5.9,<8"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: X11 Applications :: Qt",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Monitoring",
+]
+
+[project.urls]
+Repository = "https://github.com/ViskyG/process-hud"
+Issues = "https://github.com/ViskyG/process-hud/issues"
+Documentation = "https://github.com/ViskyG/process-hud/blob/main/README.md"
+
+[project.optional-dependencies]
+ui = ["PySide6-Essentials>=6.8.3,<7"]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+process-hud = "process_hud.cli:main"
+process-hud-codex = "process_hud.codex_bridge:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
