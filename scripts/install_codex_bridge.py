@@ -41,7 +41,7 @@ def setting(text, value):
 def current_cli_executable(text):
     """Read the VS Code setting without losing comments or guessing its value."""
     masked = mask_comments(text)
-    pattern = r'"chatgpt\\.cliExecutable"\\s*:\\s*("(?:\\\\.|[^"\\\\])*"|null)'
+    pattern = r'"chatgpt\.cliExecutable"\s*:\s*("(?:\\.|[^"\\])*"|null)'
     matches = list(re.finditer(pattern, masked))
     if len(matches) > 1:
         raise ValueError('Duplicate cliExecutable settings; resolve before installing')
