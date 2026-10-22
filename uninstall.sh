@@ -21,11 +21,15 @@ if [[ -L "$BIN/process-hud" && $(readlink -- "$BIN/process-hud") == "$BASE/venv/
   rm -- "$BIN/process-hud"
 fi
 # Preserve potentially user-edited skills rather than recursively deleting them.
-if [[ -d "$SKILLS/process-hud" ]]; then
+if [[ -f "$BASE/.process-hud-skill-path" &&
+      $(cat -- "$BASE/.process-hud-skill-path") == "$SKILLS/process-hud" &&
+      ( -e "$SKILLS/process-hud" || -L "$SKILLS/process-hud" ) ]]; then
   ARCHIVE="${XDG_STATE_HOME:-$HOME/.local/state}/process-hud/skill-backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
   mkdir -p "$ARCHIVE"
   mv -- "$SKILLS/process-hud" "$ARCHIVE/"
   printf 'Skill preserved: %s\n' "$ARCHIVE/process-hud"
+elif [[ -e "$SKILLS/process-hud" || -L "$SKILLS/process-hud" ]]; then
+  printf 'Existing skill left in place: no matching installation receipt for %s\n' "$SKILLS/process-hud"
 fi
 # Rename installation to a recovery directory instead of deleting code/previous backups.
 ARCHIVE="${BASE}.uninstalled-$(date -u +%Y%m%dT%H%M%SZ)-$$"

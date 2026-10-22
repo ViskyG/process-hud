@@ -128,3 +128,39 @@ def test_log_failure_does_not_erase_docker_terminal_evidence(monkeypatch):
     o=adapters.observe({'backend':'docker','target':{'container':'c'}},with_logs=True)
     assert o.finished and o.state=='succeeded'
     assert 'Logs unavailable' in o.detail
+
+
+def test_docker_boolean_exit_code_is_not_success_evidence():
+    observation = docker_snapshot(docker('exited', False), {'container': 'fixture'})
+    assert observation.state == 'unknown' and observation.code is None
+
+
+@pytest.mark.parametrize('changes', [
+    {'state': 'running', 'finished': True},
+    {'state': 'succeeded', 'finished': True, 'exit_code': 7},
+    {'schema_version': True},
+    {'state': []},
+])
+def test_remote_inconsistent_receipt_is_rejected(monkeypatch, changes):
+    from process_hud import adapters
+    result = {'schema_version': 1, 'id': 'a'*32, 'state': 'running',
+              'finished': False, 'observation': 'live'} | changes
+    monkeypatch.setattr(adapters, 'remote_rpc', lambda *a: result)
+    with pytest.raises(ValueError):
+        observe({'backend': 'ssh', 'target': {'remote_id': 'a'*32}})
+
+
+def test_remote_progress_preserves_measurement_age_and_eta_source(monkeypatch):
+    from process_hud import adapters
+    from process_hud.model import public_progress
+    now = time.time()
+    measurement = now-40
+    result = {'schema_version': 1, 'id': 'a'*32, 'state': 'running',
+              'finished': False, 'observation': 'live', 'progress': {
+                  'percent': 50, 'eta_seconds': 10, 'eta_source': 'rate_estimate',
+                  'updated_at': now, 'measurement_at': measurement}}
+    monkeypatch.setattr(adapters, 'remote_rpc', lambda *a: result)
+    observation = observe({'backend': 'ssh', 'target': {'remote_id': 'a'*32}})
+    assert observation.progress['measurement_at'] == measurement
+    assert observation.progress['eta_source'] == 'rate_estimate'
+    assert public_progress(observation.progress)['eta_seconds'] is None

@@ -76,9 +76,12 @@ class Store:
                    removed_at=None, capabilities={})
         with self.connect() as c:
             c.execute('BEGIN IMMEDIATE')
-            existing = c.execute('SELECT data,fingerprint FROM tasks WHERE id=? OR idem=?',
-                                 (task_id, key)).fetchone()
-            if existing:
+            matches = c.execute('SELECT data,fingerprint FROM tasks WHERE id=? OR idem=?',
+                                (task_id, key)).fetchall()
+            if len(matches) > 1:
+                raise ValueError('Task ID and idempotency key refer to different tasks')
+            if matches:
+                existing = matches[0]
                 if existing[1] != fingerprint:
                     raise ValueError('Idempotency key/task ID already has different launch parameters')
                 return json.loads(existing[0]), False
@@ -129,20 +132,37 @@ class Store:
             j.update(values)
         return self.mutate(job_id, change)
 
+    @staticmethod
+    def _apply_progress(job, event):
+        if job['finished']:
+            raise ValueError('Cannot update progress after final receipt')
+        updated = progress(job['progress'], event)
+        request = job.get('attention_request')
+        if 'attention' in event:
+            reason = event['attention']
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError('attention must be a nonempty reason string')
+            reason = clean(reason, 1000)
+            if (request or {}).get('reason') != reason:
+                request = {'id': uuid.uuid4().hex, 'reason': reason, 'created_at': time.time()}
+        # Commit the event only after all of its fields have been validated.
+        job['progress'] = updated
+        if request is not None:
+            job['attention_request'] = request
+
     def set_progress(self, job_id, event):
-        def change(j):
-            if j['finished']:
+        return self.mutate(job_id, lambda job: self._apply_progress(job, event))
+
+    def set_progress_batch(self, job_id, events):
+        """Apply stdout events in order in one transaction; malformed lines are data."""
+        def change(job):
+            if job['finished']:
                 raise ValueError('Cannot update progress after final receipt')
-            j['progress'] = progress(j['progress'], event)
-            if 'attention' in event:
-                reason = event['attention']
-                if not isinstance(reason, str) or not reason.strip():
-                    raise ValueError('attention must be a nonempty reason string')
-                reason = clean(reason, 1000)
-                previous = j.get('attention_request') or {}
-                if previous.get('reason') != reason:
-                    j['attention_request'] = {'id': uuid.uuid4().hex, 'reason': reason,
-                                              'created_at': time.time()}
+            for event in events:
+                try:
+                    self._apply_progress(job, event)
+                except (ValueError, TypeError):
+                    continue
         return self.mutate(job_id, change)
 
     def finish(self, job_id, state, *, code=None, detail='', evidence=''):

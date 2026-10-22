@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import selectors
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -54,10 +55,14 @@ def workload_environment(store: Store, job_id: str) -> dict:
 def spawn_worker(store: Store, job_id: str, *, recover: bool = False) -> dict:
     with lock_file(store.home/'launch.lock'):
         job = store.get(job_id)
-        if job['finished'] or alive(job.get('worker')) is not False:
+        if (job['finished'] or
+                (alive(job.get('worker')) is not False and not job.get('worker_stopping'))):
             return job
         if job['backend'] == 'external':
             return job
+        # A restored row can hand off from an observer already committed to
+        # detaching. The replacement waits for its predecessor's lifetime lock.
+        store.update(job_id, worker_ready=False, worker_stopping=False)
         args = [sys.executable, '-m', 'process_hud', '--home', str(store.home), '_worker', job_id]
         if recover:
             args += ['--recover']
@@ -98,7 +103,9 @@ def launch(store: Store, title: str, argv: list[str], *, cwd=None, key=None, tas
     if not Path(workdir).is_dir():
         raise ValueError('Working directory does not exist')
     # Keep the executable's symlink path: Python venvs use it to locate pyvenv.cfg.
-    executable = (shutil.which(argv[0], path=os.environ.get('PATH')) if '/' not in argv[0]
+    search_path = os.pathsep.join(os.path.abspath(os.path.join(workdir, entry))
+                                  for entry in os.get_exec_path())
+    executable = (shutil.which(argv[0], path=search_path) if '/' not in argv[0]
                   else os.path.abspath(os.path.join(workdir, os.path.expanduser(argv[0]))))
     if not executable or not Path(executable).is_file() or not os.access(executable, os.X_OK):
         raise ValueError(f'Executable not found/not executable: {argv[0]}')
@@ -202,7 +209,8 @@ def recover_job(store, job_id, *, restored=False):
     if job['removed_at']:
         return
     if (not job['finished'] and job['backend'] != 'external' and
-            (restored or time.time()-job['created_at'] > 4) and alive(job.get('worker')) is False):
+            (restored or time.time()-job['created_at'] > 4) and
+            (alive(job.get('worker')) is False or job.get('worker_stopping'))):
         spawn_worker(store, job['id'], recover=True)
     from .codex_bridge import enqueue
     enqueue(store, store.get(job_id))
@@ -222,8 +230,9 @@ def managed(store, job):
     if job.get('started_at'):
         raise RuntimeError('Refusing to execute the same job twice')
     # Persist the launch attempt BEFORE spawning. A crash here is unknown, not a retry.
-    store.update(jid, started_at=time.time(), capabilities={'liveness': True, 'logs': True,
-                 'exit_code': True, 'progress': True, 'descendants': True})
+    capabilities = {'liveness': True, 'logs': True, 'exit_code': True,
+                    'progress': True, 'descendants': True}
+    store.update(jid, started_at=time.time(), capabilities=capabilities)
     env = workload_environment(store, jid)
     log = RotatingLog(store.task_dir(jid)/'output.log', int(store.setting('log_bytes')))
     try:
@@ -238,14 +247,31 @@ def managed(store, job):
         process_ref = identity(p.pid)
     except psutil.NoSuchProcess:
         process_ref = None
-    store.update(jid, process=process_ref, state='running')
+    def observed_update(**values):
+        try:
+            store.update(jid, **values)
+        except (OSError, sqlite3.Error):
+            # A transient state-store failure cannot justify closing a running
+            # workload's stdout. Final persistence is attempted after reaping.
+            pass
+
+    observed_update(process=process_ref, state='running')
     os.set_blocking(p.stdout.fileno(), False)
     sel = selectors.DefaultSelector(); sel.register(p.stdout, selectors.EVENT_READ)
-    buffer = b''; pending = None; last_flush = 0.0; last_heartbeat = 0.0
-    main_code = None; adopted_failure = None
+    buffer = b''; pending = []; last_flush = 0.0; last_heartbeat = 0.0
+    main_code = None; adopted_failure = None; log_error = ''
+
+    def flush_progress():
+        nonlocal pending, last_flush
+        if pending:
+            try:
+                store.set_progress_batch(jid, pending)
+            except (ValueError, OSError, sqlite3.Error):
+                pass
+            pending = []
+            last_flush = time.monotonic()
 
     def line(data):
-        nonlocal pending
         s = clean(data.decode('utf8', 'replace'), 65536).strip()
         if s.startswith('@@HUD '):
             try:
@@ -253,23 +279,35 @@ def managed(store, job):
                 if not isinstance(obj, dict):
                     return
                 # Output can report progress/attention, NEVER terminal status or commands.
-                pending = (pending or {}) | {k: v for k, v in obj.items() if k in
-                           {'current','total','percent','phase','unit','message','eta_seconds','indeterminate','attention'}}
-                pending['source'] = 'structured_stdout'
+                event = {k: v for k, v in obj.items() if k in
+                         {'current','total','percent','phase','unit','message','eta_seconds','indeterminate','attention'}}
+                event['source'] = 'structured_stdout'
+                pending.append(event)
             except (ValueError, TypeError):
                 pass
         elif t.get('parser') == 'percent':
             matches = PERCENT.findall(s)
             if matches:
-                attention = {k: v for k, v in (pending or {}).items() if k == 'attention'}
-                pending = dict(attention, percent=float(matches[-1]), source='opt_in_percent_parser')
+                pending.append(dict(percent=float(matches[-1]), source='opt_in_percent_parser'))
+        # Retain event order and validation semantics without a database write
+        # per line or an unbounded in-memory queue under noisy workloads.
+        if len(pending) >= 256:
+            flush_progress()
 
     try:
         while True:
             for key, _ in sel.select(.1):
                 data = os.read(key.fd, 65536)
                 if data:
-                    log.write(data)
+                    if not log_error:
+                        try:
+                            log.write(data)
+                        except OSError as exc:
+                            # Losing log storage must not close the workload's pipe or
+                            # abandon wait status. Continue draining and supervising.
+                            log_error = 'Log storage unavailable: '+clean(exc, 500)
+                            capabilities['logs'] = False
+                            observed_update(capabilities=capabilities, detail=log_error)
                     buffer += data.replace(b'\r', b'\n')
                     while b'\n' in buffer:
                         entry, buffer = buffer.split(b'\n', 1)
@@ -281,14 +319,10 @@ def managed(store, job):
                     if buffer:
                         line(buffer); buffer = b''
             now = time.monotonic()
-            if pending is not None and now-last_flush >= .2:
-                try:
-                    store.set_progress(jid, pending)
-                except ValueError:
-                    pass  # Malformed progress remains just log data.
-                pending = None; last_flush = now
+            if pending and now-last_flush >= .2:
+                flush_progress()
             if now-last_heartbeat >= 2:
-                store.update(jid, last_observed_at=time.time())
+                observed_update(last_observed_at=time.time())
                 last_heartbeat = now
             main_code = p.poll()
             no_children = False
@@ -305,18 +339,28 @@ def managed(store, job):
                         adopted_failure = code
             if no_children and not sel.get_map():
                 break
-        if pending:
-            try:
-                store.set_progress(jid, pending)
-            except ValueError:
-                pass
+        flush_progress()
         code = main_code if main_code else (adopted_failure or 0)
         state = 'succeeded' if code == 0 else ('cancelled' if code < 0 else 'failed')
+        observed_update(process=process_ref, capabilities=capabilities)
         store.finish(jid, state, code=code,
-                     detail='An adopted descendant failed' if adopted_failure and not main_code else '',
+                     detail='; '.join(x for x in (
+                         'An adopted descendant failed' if adopted_failure and not main_code else '',
+                         log_error) if x),
                      evidence='Direct wait status plus all adopted descendants reaped')
     finally:
-        sel.close(); p.stdout.close(); log.close()
+        sel.close(); p.stdout.close()
+        try:
+            log.close()
+        except OSError:
+            pass
+
+
+def _write_log_snapshot(store, job_id, content):
+    path = store.task_dir(job_id)/'output.log'
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write(clean(content, 32768))
 
 
 def watch(store, job):
@@ -327,8 +371,14 @@ def watch(store, job):
             return
         if job['removed_at']:
             # Observation-only work is detached; actual workload is untouched.
-            store.update(jid, state='unknown', observation='lost', detail='Monitoring detached by record removal')
-            return
+            def detach(current):
+                if current['removed_at'] and not current['finished']:
+                    current.update(state='unknown', observation='lost', worker_stopping=True,
+                                   detail='Monitoring detached by record removal')
+            detached = store.mutate(jid, detach)
+            if detached.get('worker_stopping') or detached['finished']:
+                return
+            continue  # Undo won the transaction; keep observing this same workload.
         try:
             o = adapters.observe(job, with_logs=(polls % 5 == 0))
             changes = {'state': o.state, 'observation': o.availability, 'detail': o.detail,
@@ -346,30 +396,30 @@ def watch(store, job):
                 except (ValueError, TypeError):
                     pass
             if o.log is not None:
-                path = store.task_dir(jid)/'output.log'
-                fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-                with os.fdopen(fd, 'w') as f:
-                    f.write(clean(o.log, 32768))
-            if job['backend'] == 'pid' and job['target'].get('log_file') and polls % 5 == 0:
+                try:
+                    _write_log_snapshot(store, jid, o.log)
+                except (OSError, ValueError) as exc:
+                    o.detail += ' Log snapshot unavailable: '+clean(exc, 500)
+            if (job['backend'] == 'pid' and job['target'].get('log_file') and
+                    (polls % 5 == 0 or o.finished)):
                 try:
                     content = tail(Path(job['target']['log_file']))
-                    with (store.task_dir(jid)/'output.log').open('w') as f:
-                        f.write(content)
-                    os.chmod(f.name, 0o600)
-                except (OSError, ValueError):
-                    pass
+                    _write_log_snapshot(store, jid, content)
+                except (OSError, ValueError) as exc:
+                    o.detail += ' Log snapshot unavailable: '+clean(exc, 500)
             if o.finished:
                 # Capture one final bounded log snapshot; failure does not undo terminal evidence.
                 if job['backend'] not in ('pid', 'managed') and polls % 5:
                     try:
                         final = adapters.observe(store.get(jid), with_logs=True)
                         if final.log is not None:
-                            (store.task_dir(jid)/'output.log').write_text(clean(final.log, 32768))
-                            (store.task_dir(jid)/'output.log').chmod(0o600)
-                    except (OSError, ValueError, RuntimeError, TimeoutError, KeyError):
-                        pass
+                            _write_log_snapshot(store, jid, final.log)
+                    except (OSError, ValueError, RuntimeError, TimeoutError, KeyError) as exc:
+                        o.detail += ' Final log snapshot unavailable: '+clean(exc, 500)
                 store.finish(jid, o.state, code=o.code, detail=o.detail, evidence=o.evidence)
                 return
+            if o.detail != changes['detail']:
+                store.update(jid, detail=o.detail)
         except (OSError, ValueError, RuntimeError, TimeoutError, KeyError, IndexError) as exc:
             store.update(jid, state='unknown', observation='disconnected', detail=clean(exc, 1000))
         polls += 1
@@ -378,11 +428,11 @@ def watch(store, job):
 
 def worker(store, job_id, recover=False):
     try:
-        with lock_file(store.task_dir(job_id)/'worker.lock', blocking=False):
+        with lock_file(store.task_dir(job_id)/'worker.lock', blocking=recover):
             job = store.get(job_id)
             if job['finished']:
                 return
-            store.update(job_id, worker=identity(os.getpid()), worker_ready=True)
+            store.update(job_id, worker=identity(os.getpid()), worker_ready=True, worker_stopping=False)
             if job['backend'] == 'managed' and not recover and not job.get('started_at'):
                 managed(store, job)
             else:

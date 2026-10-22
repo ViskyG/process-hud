@@ -73,3 +73,45 @@ def test_bounded_log(tmp_path):
 def test_invalid_task_path(store):
     with pytest.raises(ValueError):
         store.task_dir('../../elsewhere')
+
+
+def test_task_id_and_key_cannot_alias_different_records(store):
+    first, _ = store.create('same spec', 'external', key='first')
+    second, _ = store.create('same spec', 'external', key='second')
+    with pytest.raises(ValueError, match='different tasks'):
+        store.create('same spec', 'external', task_id=first['id'], key='second')
+    assert len(store.list()) == 2
+    same, created = store.create('same spec', 'external', task_id=second['id'], key='second')
+    assert not created and same['id'] == second['id']
+
+
+def test_progress_batch_preserves_order_and_skips_invalid_events_atomically(store):
+    job, _ = store.create('producer', 'external')
+    result = store.set_progress_batch(job['id'], [
+        {'current': 20, 'total': 100, 'phase': 'first'},
+        {'percent': 40},
+        {'percent': 99, 'attention': ''},
+        {'phase': 'next', 'current': 3},
+        {'attention': 'needs decision'},
+        {'percent': float('nan')},
+    ])
+    assert result['progress']['current'] == 3
+    assert result['progress']['percent'] is None
+    assert 'total' not in result['progress']
+    assert result['attention_request']['reason'] == 'needs decision'
+    request_id = result['attention_request']['id']
+    result = store.set_progress_batch(job['id'], [{'attention': 'needs decision'}])
+    assert result['attention_request']['id'] == request_id
+    store.finish(job['id'], 'succeeded', code=0)
+    with pytest.raises(ValueError, match='final receipt'):
+        store.set_progress_batch(job['id'], [{'percent': 5}])
+    assert store.get(job['id'])['state'] == 'succeeded'
+
+
+def test_invalid_attention_does_not_partially_apply_batch_progress(store):
+    job, _ = store.create('producer', 'external')
+    result = store.set_progress_batch(job['id'], [
+        {'percent': 10}, {'percent': 99, 'attention': ''},
+    ])
+    assert result['progress']['percent'] == 10
+    assert 'attention_request' not in result

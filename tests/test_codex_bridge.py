@@ -145,7 +145,8 @@ def test_worker_continuation_uses_verified_root_owner(tmp_path, monkeypatch):
     monkeypatch.setenv('PROCESS_HUD_CODEX_INSTANCE', 'test-relay')
     monkeypatch.setattr(bridge, 'endpoints', lambda: [{'instance': 'test-relay',
         'socket': '/unused', 'threads': ['root', 'worker', 'nested']}])
-    monkeypatch.setattr(bridge, 'call', lambda *a: {'initialized': True})
+    monkeypatch.setattr(bridge, 'call', lambda *a: {'initialized': True,
+        'instance': 'test-relay', 'threads': ['root', 'worker', 'nested']})
     origin = current_origin()
     assert origin['thread_id'] == 'root'
     assert origin['source_thread_id'] == 'nested'
@@ -253,3 +254,138 @@ def test_dispatcher_waits_through_a_missing_owner_then_delivers(relay, store):
             break
         time.sleep(.03)
     assert final['codex_delivery']['state'] == 'accepted'
+
+
+def test_server_requests_do_not_consume_ide_response_tracking(tmp_path):
+    relay = Relay(tmp_path/'bridge', [])
+    relay.from_ide({'id': 1, 'method': 'initialize', 'params': {}})
+    approval = {'id': 1, 'method': 'item/commandExecution/requestApproval',
+                'params': {'threadId': 'thread-source'}}
+    assert relay.from_server(approval) is True
+    assert relay.from_server({'id': 1, 'result': {'userAgent': 'fake/1'}}) is True
+    assert relay.initialized
+    relay.from_ide({'id': 2, 'method': 'thread/resume',
+                   'params': {'threadId': 'thread-source'}})
+    assert relay.from_server(dict(approval, id=2)) is True
+    assert relay.from_server({'id': 2, 'result': {}}) is True
+    assert 'thread-source' in relay.threads
+
+
+def test_server_request_using_internal_prefix_is_still_forwarded(tmp_path):
+    relay = Relay(tmp_path/'bridge', [])
+    assert relay.from_server({'id': 'hud:server-request',
+                              'method': 'item/tool/call', 'params': {}}) is True
+    # Late replies to the relay's own requests still stay out of IDE traffic.
+    assert relay.from_server({'id': 'hud:old-response', 'result': {}}) is False
+
+
+def test_accepted_receipt_survives_conversation_unload(store, tmp_path, monkeypatch):
+    relay = Relay(tmp_path/'bridge', [])
+    relay.initialized = True
+    relay.threads.add('thread-source')
+    job = terminal_job(store, relay.home)
+    calls = []
+    monkeypatch.setattr(relay, 'send_rpc', lambda method, params:
+                        calls.append(params) or {'result': {'turn': {'id': 'accepted'}}})
+    accepted = relay.deliver(store.home, job['id'])
+    assert accepted['state'] == 'accepted'
+    relay.threads.clear()
+    assert relay.deliver(store.home, job['id']) == accepted
+    assert len(calls) == 1
+
+
+def test_numeric_and_string_request_ids_remain_distinct(tmp_path):
+    relay = Relay(tmp_path/'bridge', [])
+    relay.from_ide({'id': 1, 'method': 'initialize', 'params': {}})
+    relay.from_ide({'id': '1', 'method': 'thread/resume',
+                   'params': {'threadId': 'thread-source'}})
+    relay.from_server({'id': 1, 'result': {}})
+    assert relay.initialized
+    assert not relay.threads
+    relay.from_server({'id': '1', 'result': {}})
+    assert relay.threads == {'thread-source'}
+
+
+def test_server_launch_failure_removes_local_socket(tmp_path):
+    import shutil
+    import tempfile
+    home = Path(tempfile.mkdtemp(prefix='hud-failed-launch-'))
+    config = tmp_path/'missing-config.json'
+    config.write_text(json.dumps({'real_binary': str(tmp_path/'missing-codex')}))
+    env = dict(os.environ, PROCESS_HUD_CODEX_BRIDGE=str(home),
+               PROCESS_HUD_CODEX_CONFIG=str(config),
+               PYTHONPATH=str(Path(__file__).resolve().parents[1]/'src'))
+    try:
+        result = subprocess.run([sys.executable, '-m', 'process_hud.codex_bridge', 'app-server'],
+                                stdin=subprocess.DEVNULL, capture_output=True, env=env, timeout=5)
+        assert result.returncode != 0
+        assert b'FileNotFoundError' in result.stderr
+        assert not list(home.glob('*.sock'))
+        assert not list(home.glob('*.json'))
+    finally:
+        shutil.rmtree(home)
+
+
+def test_failed_audit_write_does_not_break_ide_traffic(store, tmp_path, monkeypatch):
+    relay = Relay(tmp_path/'bridge', [])
+    relay.audit_path.mkdir()  # Opening an audit file now raises IsADirectoryError.
+    relay.initialized = True
+    relay.threads.add('thread-source')
+    relay.from_ide({'id': 1, 'method': 'turn/start',
+                   'params': {'threadId': 'thread-source'}})
+    assert relay.from_server({'method': 'thread/tokenUsage/updated', 'params': {
+        'threadId': 'thread-source', 'tokenUsage': {'total': {'totalTokens': 11}}}}) is True
+    job = terminal_job(store, relay.home)
+    monkeypatch.setattr(relay, 'send_rpc', lambda method, params:
+                        {'result': {'turn': {'id': 'accepted'}}})
+    assert relay.deliver(store.home, job['id'])['state'] == 'accepted'
+
+
+def test_failed_metadata_write_does_not_break_ide_traffic(tmp_path):
+    relay = Relay(tmp_path/'bridge', [])
+    relay.metadata_path.mkdir()  # Atomic replacement fails; traffic must continue.
+    relay.from_ide({'id': 1, 'method': 'initialize', 'params': {}})
+    assert relay.from_server({'id': 1, 'result': {}}) is True
+    assert relay.initialized
+    assert relay.from_server({'method': 'thread/started', 'params': {
+        'thread': {'id': 'thread-source'}}}) is True
+    assert relay.from_server({'method': 'turn/started', 'params': {
+        'threadId': 'thread-source', 'turn': {'id': 'turn-one'}}}) is True
+    assert relay.active_turns == {'thread-source': 'turn-one'}
+    assert relay.from_server({'method': 'thread/closed', 'params': {
+        'threadId': 'thread-source'}}) is True
+    assert not relay.threads and not relay.active_turns
+    assert not list(relay.home.glob('*.tmp'))
+
+
+def test_stale_metadata_cannot_authorize_an_unloaded_owner(tmp_path, monkeypatch):
+    import process_hud.codex_bridge as bridge
+    session_metadata(tmp_path, 'root')
+    monkeypatch.setenv('CODEX_HOME', str(tmp_path))
+    monkeypatch.setenv('CODEX_THREAD_ID', 'root')
+    monkeypatch.setenv('PROCESS_HUD_CODEX_INSTANCE', 'test-relay')
+    monkeypatch.setattr(bridge, 'endpoints', lambda: [{'instance': 'test-relay',
+        'socket': '/unused', 'threads': ['root']}])
+    monkeypatch.setattr(bridge, 'call', lambda *a: {'initialized': True,
+        'instance': 'test-relay', 'threads': []})
+    with pytest.raises(ValueError, match='no longer loaded'):
+        current_origin()
+
+
+def test_delivery_database_connection_closes_after_transaction(tmp_path):
+    import sqlite3
+    relay = Relay(tmp_path/'bridge', [])
+    with relay.db() as connection:
+        connection.execute('INSERT INTO stores VALUES(?)', ('temporary-test-store',))
+    with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+        connection.execute('SELECT home FROM stores')
+    with relay.db() as reopened:
+        assert reopened.execute('SELECT home FROM stores').fetchall() == [('temporary-test-store',)]
+
+
+def test_ide_request_using_internal_prefix_keeps_its_response(tmp_path):
+    relay = Relay(tmp_path/'bridge', [])
+    relay.from_ide({'id': 'hud:client', 'method': 'initialize', 'params': {}})
+    assert relay.from_server({'id': 'hud:client', 'result': {}}) is True
+    assert relay.initialized
+    assert relay.from_server({'id': 'hud:old-response', 'result': {}}) is False

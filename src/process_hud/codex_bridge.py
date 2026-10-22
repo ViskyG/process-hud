@@ -6,6 +6,7 @@ contain lifecycle/token counters, never prompts, commands, credentials or logs.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -38,9 +39,12 @@ def bridge_home() -> Path:
 def atomic_json(path, value):
     tmp = path.with_name(path.name+'.'+uuid.uuid4().hex+'.tmp')
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, 'w') as f:
-        json.dump(value, f)
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(value, f)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def call(path, request, timeout=20):
@@ -112,8 +116,12 @@ def current_origin():
     if len(selected or candidates) != 1:
         raise ValueError('No unique live Codex bridge for this conversation; no work was launched')
     endpoint = (selected or candidates)[0]
-    if not call(endpoint['socket'], {'op': 'status'}).get('initialized'):
+    status = call(endpoint['socket'], {'op': 'status'})
+    if not status.get('initialized'):
         raise ValueError('Codex bridge has not initialized; no work was launched')
+    if (status.get('instance') != endpoint['instance'] or
+            thread not in status.get('threads', []) or owner not in status.get('threads', [])):
+        raise ValueError('Source conversation is no longer loaded; no work was launched')
     origin = {'thread_id': owner, 'bridge_home': str(bridge_home()),
               'instance': endpoint['instance']}
     if owner != thread:
@@ -181,11 +189,17 @@ def dispatch(home, job_id):
             time.sleep(1)
 
 
+@contextlib.contextmanager
 def bridge_db(home):
     p = home/'deliveries.sqlite3'
     fd = os.open(p, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     os.close(fd)
-    return sqlite3.connect(p, timeout=10)
+    connection = sqlite3.connect(p, timeout=10)
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 class Relay:
@@ -234,10 +248,15 @@ class Relay:
             self.stopping.wait(5)
 
     def audit(self, event, **fields):
-        with self.state_lock:
-            fd = os.open(self.audit_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
-            with os.fdopen(fd, 'a') as f:
-                f.write(json.dumps(dict(time=time.time(), event=event, **fields))+'\n')
+        try:
+            with self.state_lock:
+                fd = os.open(self.audit_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+                with os.fdopen(fd, 'a') as f:
+                    f.write(json.dumps(dict(time=time.time(), event=event, **fields))+'\n')
+        except OSError:
+            # Diagnostic output must not break the IDE's App Server connection.
+            # Delivery receipts remain transactional in the separate database.
+            pass
 
     def metadata(self):
         with self.state_lock:
@@ -248,12 +267,20 @@ class Relay:
                     'active_turns': dict(self.active_turns),
                     'initialized': self.initialized, 'audit': str(self.audit_path)}
 
+    def publish_metadata(self):
+        try:
+            atomic_json(self.metadata_path, self.metadata())
+        except OSError:
+            # The IDE connection remains usable when discovery cannot be saved.
+            # current_origin checks live socket state before authorizing a job.
+            pass
+
     def remember(self, thread):
         if isinstance(thread, str) and THREAD_RE.fullmatch(thread):
             with self.state_lock:
                 if thread not in self.threads:
                     self.threads.add(thread)
-                    atomic_json(self.metadata_path, self.metadata())
+                    self.publish_metadata()
 
     def send(self, line):
         with self.write_lock:
@@ -276,19 +303,23 @@ class Relay:
         method, params = message.get('method'), message.get('params') or {}
         if 'id' in message and method:
             with self.state_lock:
-                self.pending_ui[str(message['id'])] = (method, params.get('threadId'))
+                self.pending_ui[message['id']] = (method, params.get('threadId'))
         if method in ('turn/start', 'turn/steer'):
             self.audit('ide.'+method, thread=params.get('threadId'))
 
     def from_server(self, message):
         request_id = message.get('id')
+        # JSON-RPC request IDs are scoped by direction. A server approval/tool
+        # request can use the same ID as an outstanding IDE request.
+        response = 'method' not in message and ('result' in message or 'error' in message)
         with self.state_lock:
-            q = self.responses.get(request_id)
-            pending = self.pending_ui.pop(str(request_id), None) if request_id is not None else None
-        if q is not None and ('result' in message or 'error' in message):
+            q = self.responses.get(request_id) if response else None
+            pending = (self.pending_ui.pop(request_id, None)
+                       if response and request_id is not None else None)
+        if q is not None:
             q.put(message)
             return False
-        if isinstance(request_id, str) and request_id.startswith('hud:'):
+        if response and pending is None and isinstance(request_id, str) and request_id.startswith('hud:'):
             return False  # A late internal response must not enter the IDE's request namespace.
         if pending and 'result' in message:
             result = message['result'] or {}
@@ -297,7 +328,7 @@ class Relay:
                 self.remember(thread.get('id'))
             if pending[0] == 'initialize':
                 self.initialized = True
-                atomic_json(self.metadata_path, self.metadata())
+                self.publish_metadata()
             if pending[0] in ('thread/resume', 'turn/start'):
                 self.remember(pending[1])
         method, p = message.get('method'), message.get('params') or {}
@@ -307,7 +338,7 @@ class Relay:
             with self.state_lock:
                 self.threads.discard(p.get('threadId'))
                 self.active_turns.pop(p.get('threadId'), None)
-                atomic_json(self.metadata_path, self.metadata())
+                self.publish_metadata()
         if method in ('turn/started', 'turn/completed'):
             self.remember(p.get('threadId'))
             turn = p.get('turn') or {}
@@ -316,7 +347,7 @@ class Relay:
                     self.active_turns[p.get('threadId')] = turn.get('id')
                 elif self.active_turns.get(p.get('threadId')) == turn.get('id'):
                     self.active_turns.pop(p.get('threadId'), None)
-                atomic_json(self.metadata_path, self.metadata())
+                self.publish_metadata()
             self.audit(method, thread=p.get('threadId'), turn=turn.get('id'), status=turn.get('status'))
         elif method == 'thread/tokenUsage/updated':
             usage = p.get('tokenUsage') or {}
@@ -338,8 +369,6 @@ class Relay:
             raise ValueError('No eligible completion/attention event')
         if selected['state'] in {'consumed', 'dismissed', 'superseded', 'expired'}:
             return {'state': selected['state'], 'event': selected['event']}
-        if not self.initialized or thread not in self.threads:
-            return {'state': 'pending', 'reason': 'Source conversation is not loaded'}
         event = selected['event']
         with self.delivery_lock:
             # The user may dismiss/acknowledge a row while another event is sent.
@@ -355,6 +384,10 @@ class Relay:
                 previous = c.execute('SELECT state,result FROM events WHERE id=?', (event,)).fetchone()
                 if previous:
                     return json.loads(previous[1]) if previous[0] != 'sending' else {'state': 'uncertain', 'event': event}
+                # A receipt remains authoritative after its conversation unloads.
+                # Only a new delivery needs a currently loaded owner.
+                if not self.initialized or thread not in self.threads:
+                    return {'state': 'pending', 'reason': 'Source conversation is not loaded'}
                 c.execute('INSERT INTO events VALUES(?,?,?)', (event, 'sending', '{}'))
             # Only facts are supplied as tool output, with no workload-generated text.
             output = json.dumps({'process_hud_event': event, 'task_id': job_id,
@@ -416,10 +449,15 @@ class Relay:
         env = dict(os.environ, PROCESS_HUD_CODEX_BRIDGE=str(self.home),
                    PROCESS_HUD_CODEX_INSTANCE=self.instance)
         server = Server(str(self.socket_path), Handler)
-        os.chmod(self.socket_path, 0o600)
-        self.proc = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=None, env=env)
-        atomic_json(self.metadata_path, self.metadata())
+        try:
+            os.chmod(self.socket_path, 0o600)
+            self.proc = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=None, env=env)
+        except BaseException:
+            server.server_close()
+            self.socket_path.unlink(missing_ok=True)
+            raise
+        self.publish_metadata()
         self.audit('bridge.started', server_pid=self.proc.pid)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         maintenance_thread = threading.Thread(target=self.maintain, daemon=True)

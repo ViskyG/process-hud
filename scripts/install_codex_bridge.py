@@ -85,6 +85,38 @@ def current_cli_executable(text):
     return match[2] if match else None
 
 
+def known_wrapper(wrapper, python):
+    """Accept our launcher and exact pip-generated entry point templates only.
+
+    A normal package upgrade regenerates console scripts. It does not alter the
+    bridge's ownership or settings, and must not be treated as a custom wrapper.
+    Keep full-body comparisons so additional user code is never accepted merely
+    because it imports the expected entry point.
+    """
+    if not wrapper.is_file() or not os.access(wrapper, os.X_OK):
+        return False
+    first, separator, body = wrapper.read_text().partition('\n')
+    if not separator or not first.startswith('#!'):
+        return False
+    interpreter = Path(first[2:])
+    if interpreter.parent != python.parent or interpreter.resolve() != python.resolve():
+        return False
+    return body in (
+        'from process_hud.codex_bridge import main\nraise SystemExit(main())\n',
+        "# -*- coding: utf-8 -*-\nimport re\nimport sys\n"
+        "from process_hud.codex_bridge import main\n"
+        "if __name__ == '__main__':\n"
+        "    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n"
+        "    sys.exit(main())\n",
+        "# -*- coding: utf-8 -*-\nimport sys\n"
+        "from process_hud.codex_bridge import main\n"
+        "if __name__ == '__main__':\n"
+        "    if sys.argv[0].endswith('.exe'):\n"
+        "        sys.argv[0] = sys.argv[0][:-4]\n"
+        "    sys.exit(main())\n",
+    )
+
+
 def main():
     if sys.argv[1:] not in ([], ['--ensure']):
         raise ValueError('Usage: install_codex_bridge.py [--ensure]')
@@ -105,8 +137,8 @@ def main():
     if len(matches) != 1:
         raise ValueError('Expected one active Codex extension')
     real = extensions/matches[0]['relativeLocation']/'bin/linux-x86_64/codex'
-    if not real.is_file():
-        raise ValueError('Bundled Codex binary is missing')
+    if not real.is_file() or not os.access(real, os.X_OK):
+        raise ValueError('Bundled Codex binary is missing or not executable')
     settings = Path.home()/'.config/Code/User/settings.json'
     original = settings.read_text() if settings.exists() else '{}\n'
     wrapper = venv/'bin/process-hud-codex'
@@ -116,7 +148,7 @@ def main():
     config_file = base/'codex-bridge.json'
     wrapper_text = '#!'+str(python)+'\nfrom process_hud.codex_bridge import main\nraise SystemExit(main())\n'
     if existing == str(wrapper) and wrapper.is_file() and config_file.is_file():
-        if wrapper.read_text() != wrapper_text or not os.access(wrapper, os.X_OK):
+        if not known_wrapper(wrapper, python):
             raise ValueError('Configured bridge wrapper is modified or not executable; review before repairing')
         config = json.loads(config_file.read_text())
         if not isinstance(config, dict) or not isinstance(config.get('real_binary'), str):
@@ -126,7 +158,8 @@ def main():
         # The relay follows the active extension after VS Code updates it. Its
         # saved original binary may have been removed during that normal update.
         effective_binary = real if config.get('extension_root') == str(extensions) else Path(config['real_binary'])
-        if not effective_binary.is_file() or effective_binary.resolve() == wrapper.resolve():
+        if (not effective_binary.is_file() or not os.access(effective_binary, os.X_OK)
+                or effective_binary.resolve() == wrapper.resolve()):
             raise ValueError('Configured bridge binary is missing or invalid; review before repairing')
         print(json.dumps({'status': 'already_configured', 'installed': str(wrapper),
                           'reload_required': False,

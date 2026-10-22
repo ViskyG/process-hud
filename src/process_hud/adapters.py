@@ -39,7 +39,7 @@ def docker_snapshot(obj: dict, target: dict) -> Observation:
         return Observation(target=t, capabilities=caps)
     if s.get('Status') in ('exited', 'dead'):
         code = s.get('ExitCode')
-        if not isinstance(code, int):
+        if type(code) is not int:
             return Observation('unknown', 'lost', True, detail='Container exited without exit evidence', target=t)
         return Observation('succeeded' if code == 0 and not s.get('OOMKilled') else 'failed',
                            'complete', True, code, clean(s.get('Error') or ('OOM killed' if s.get('OOMKilled') else '')),
@@ -139,10 +139,11 @@ def observe(job: dict, *, with_logs: bool = False) -> Observation:
         return o
     if b == 'ssh':
         result = remote_rpc(t, {'op': 'report', 'id': t['remote_id'], 'tail': 80 if with_logs else 0})
-        if result.get('id') != t['remote_id'] or result.get('schema_version') != 1:
+        if (result.get('id') != t['remote_id'] or type(result.get('schema_version')) is not int
+                or result['schema_version'] != 1):
             raise ValueError('Remote identity/protocol mismatch')
         state = result['state']
-        if state not in {'starting', 'running', 'paused', 'unknown', 'succeeded', 'failed', 'cancelled'}:
+        if not isinstance(state, str) or state not in {'starting', 'running', 'paused', 'unknown', 'succeeded', 'failed', 'cancelled'}:
             raise ValueError('Invalid remote state')
         if type(result.get('finished')) is not bool:
             raise ValueError('Remote finished must be a boolean')
@@ -151,6 +152,10 @@ def observe(job: dict, *, with_logs: bool = False) -> Observation:
             raise ValueError('Invalid remote exit code')
         if state in ('succeeded', 'failed', 'cancelled') and not result['finished']:
             raise ValueError('Remote terminal state without terminal receipt')
+        if result['finished'] and state not in ('succeeded', 'failed', 'cancelled', 'unknown'):
+            raise ValueError('Remote finished receipt has a nonterminal state')
+        if state == 'succeeded' and code not in (None, 0):
+            raise ValueError('Remote success conflicts with exit code')
         if result.get('observation') not in ('live','disconnected','lost','complete'):
             raise ValueError('Invalid remote observation')
         p = result.get('progress') or None
@@ -158,8 +163,15 @@ def observe(job: dict, *, with_logs: bool = False) -> Observation:
             if not isinstance(p, dict):
                 raise ValueError('Invalid remote progress')
             timestamp = number(p.get('updated_at', time.time()), 'updated_at')
+            measured = number(p.get('measurement_at', timestamp), 'measurement_at')
+            eta_source = p.get('eta_source', 'reported')
+            if eta_source not in ('reported', 'rate_estimate'):
+                raise ValueError('Invalid remote ETA source')
             p = validate_progress({}, p, timestamp)
-            if timestamp > time.time()+60:
+            p['measurement_at'] = measured
+            if p.get('eta_seconds') is not None:
+                p['eta_source'] = eta_source
+            if max(timestamp, measured) > time.time()+60:
                 p['eta_seconds'] = None  # Unreconciled remote clock; no fake countdown.
         return Observation(state, result.get('observation', 'live'), bool(result.get('finished')),
                            result.get('exit_code'), clean(result.get('detail', '')),

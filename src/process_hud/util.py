@@ -68,19 +68,14 @@ def lock_file(path: Path, blocking: bool = True):
 def tool(argv: list[str], *, timeout: float = 12, input_text: str | None = None,
          max_bytes: int = 1024 * 1024) -> tuple[int, str, str]:
     """Bound helper output and runtime; kill only the helper, not its workload."""
+    payload = input_text.encode() if input_text is not None else b''
+    if len(payload) > 64000:
+        raise ValueError('Helper input exceeds 64 KB')
     with subprocess.Popen(argv, stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as p:
-        # RPC inputs are deliberately small. A tempfile avoids pipe write deadlocks.
-        # Callers use <64 KiB payloads, below the validated protocol limit.
+        # Multiplex bounded RPC input with both output streams to avoid pipe deadlocks.
         if input_text is not None:
-            payload = input_text.encode()
-            if len(payload) > 64000:
-                p.kill(); p.wait()
-                raise ValueError('Helper input exceeds 64 KB')
-            # Nonblocking stdin is multiplexed with stdout and stderr below.
             os.set_blocking(p.stdin.fileno(), False)
-        else:
-            payload = b''
         sel = selectors.DefaultSelector()
         output = {'out': bytearray(), 'err': bytearray()}
         for label, stream in [('out', p.stdout), ('err', p.stderr)]:
@@ -110,7 +105,10 @@ def tool(argv: list[str], *, timeout: float = 12, input_text: str | None = None,
                         output[key.data].extend(data)
                         if sum(map(len, output.values())) > max_bytes:
                             raise ValueError('Helper response exceeds size limit')
-            p.wait(timeout=max(.01, deadline-time.monotonic()))
+            try:
+                p.wait(timeout=max(.01, deadline-time.monotonic()))
+            except subprocess.TimeoutExpired as exc:
+                raise TimeoutError(f'Helper timed out: {argv[0]}') from exc
             return p.returncode, output['out'].decode('utf8', 'replace'), output['err'].decode('utf8', 'replace')
         finally:
             sel.close()

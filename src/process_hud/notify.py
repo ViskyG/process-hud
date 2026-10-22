@@ -1,5 +1,6 @@
 """Best-effort native notifications; never bypass GNOME quiet/mute settings."""
 from __future__ import annotations
+import json
 import shutil
 from .model import summary
 from .util import tool
@@ -40,8 +41,9 @@ def completed(store, job):
                          if sound and server_sound else "{'suppress-sound': <true>}")
                 code, _, _ = tool(['gdbus', 'call', '--session', '--dest', 'org.freedesktop.Notifications',
                     '--object-path', '/org/freedesktop/Notifications', '--method',
-                    'org.freedesktop.Notifications.Notify', 'Process HUD', '0', '',
-                    job['title'], summary(job), '[]', hints, '5000'], timeout=3)
+                    'org.freedesktop.Notifications.Notify', '--', 'Process HUD', '0', '',
+                    json.dumps(job['title'], ensure_ascii=False),
+                    json.dumps(summary(job), ensure_ascii=False), '[]', hints, '5000'], timeout=3)
                 delivered = code == 0
             if not delivered and shutil.which('notify-send'):
                 args = ['notify-send', '--app-name=Process HUD', '--urgency=normal']

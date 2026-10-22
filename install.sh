@@ -34,7 +34,8 @@ if alive(s.setting('ui_identity')) is True or any(alive(j.get('worker')) is True
     raise SystemExit('Existing HUD/observers are still running. Finish work and use process-hud ui quit before upgrading.')
 PY
 fi
-mkdir -p -- "$BASE" "$BIN" "$SKILLS"
+mkdir -p -- "$BASE" "$BIN"
+if [[ $MODE == ui ]]; then mkdir -p -- "$SKILLS"; fi
 if [[ -e "$BIN/process-hud" && ! -L "$BIN/process-hud" ]]; then
   echo "Refusing to replace an unrelated executable: $BIN/process-hud" >&2; exit 2
 fi
@@ -64,13 +65,18 @@ if [[ $MODE == ui ]]; then
     printf 'Previous skill preserved at %s\n' "$BACKUP/process-hud"
   fi
   cp -a -- "$HERE/skills/process-hud" "$SKILLS/process-hud"
+  # Headless installs do not own an existing desktop skill. Keep this receipt
+  # across a later UI -> headless upgrade so uninstall still preserves our copy.
+  printf '%s\n' "$SKILLS/process-hud" > "$BASE/.process-hud-skill-path"
   if command -v gsettings >/dev/null && [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]] &&
      [[ ${XDG_CURRENT_DESKTOP:-} == *GNOME* || ${DESKTOP_SESSION:-} == ubuntu ]]; then
     "$BASE/venv/bin/python" "$BASE/scripts/gnome_shortcut.py" install --bin "$BIN/process-hud" ||
       printf 'GNOME shortcut was not installed; existing bindings were preserved.\n' >&2
   fi
 fi
-printf '\nInstalled: %s\nSkill directory: %s\nNo autostart or background tasks enabled.\n' "$BIN/process-hud" "$SKILLS/process-hud"
+printf '\nInstalled: %s\n' "$BIN/process-hud"
+if [[ $MODE == ui ]]; then printf 'Skill directory: %s\n' "$SKILLS/process-hud"; fi
+printf 'No autostart or background tasks enabled.\n'
 case ":$PATH:" in
   *":$BIN:"*) ;;
   *) printf 'This shell PATH does not include %s. Invoke its full path or add it to PATH.\n' "$BIN" ;;

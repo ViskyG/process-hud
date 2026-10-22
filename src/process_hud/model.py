@@ -10,7 +10,10 @@ STATES = {'starting', 'running', 'paused', 'unknown'} | TERMINAL
 def number(value, name: str, *, minimum: float = 0, maximum: float = float('inf')) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f'{name} must be a number')
-    value = float(value)
+    try:
+        value = float(value)
+    except OverflowError as exc:
+        raise ValueError(f'{name} out of range') from exc
     if not math.isfinite(value) or not minimum <= value <= maximum:
         raise ValueError(f'{name} out of range')
     return value
@@ -39,12 +42,17 @@ def progress(previous: dict | None, event: dict, now: float | None = None) -> di
     if total is not None:
         total = number(total, 'total', minimum=1e-12)
         p['total'] = total
+    reported_percent = event.get('percent')
+    if reported_percent is not None:
+        reported_percent = number(reported_percent, 'percent', maximum=100)
     if current is not None and total is not None:
         if current > total:
             raise ValueError('current exceeds total')
         p['percent'] = current / total * 100
-    elif event.get('percent') is not None:
-        p['percent'] = number(event['percent'], 'percent', maximum=100)
+        if reported_percent is not None and not math.isclose(p['percent'], reported_percent, abs_tol=1e-7):
+            raise ValueError('percent conflicts with current/total')
+    elif reported_percent is not None:
+        p['percent'] = reported_percent
     elif not any(k in event for k in ('current', 'total', 'percent')):
         p['percent'] = old.get('percent')
     # Measurements, not message-only heartbeats, drive a rate sample.
@@ -54,6 +62,10 @@ def progress(previous: dict | None, event: dict, now: float | None = None) -> di
     extent = total if current is not None and total is not None else 100.0
     signature = ('units', total, unit) if current is not None and total is not None else ('percent', 100, '')
     sample = old.get('_sample')
+    # A changed total or measurement basis invalidates the previous estimate,
+    # including updates which only supply a new total and no current counter.
+    if sample and (tuple(sample['signature']) != signature or value is None):
+        sample = None
     if measured and value is not None:
         base = sample if sample and tuple(sample['signature']) == signature and value >= sample['value'] else None
         if base and now > base['time'] and value > base['value']:
@@ -90,7 +102,7 @@ def progress(previous: dict | None, event: dict, now: float | None = None) -> di
         p['eta_source'] = 'reported'
         p['measurement_at'] = now
     elif p['eta_seconds'] is not None:
-        p['eta_source'] = 'rate_estimate'
+        p['eta_source'] = old.get('eta_source', 'rate_estimate') if not measured else 'rate_estimate'
     return p
 
 

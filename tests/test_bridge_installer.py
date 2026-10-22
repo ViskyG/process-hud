@@ -40,6 +40,7 @@ def fixture_installation(tmp_path, monkeypatch):
     client = extensions / "openai.chatgpt-1/bin/linux-x86_64/codex"
     client.parent.mkdir(parents=True)
     client.write_text("fake Codex\n")
+    client.chmod(0o755)
     (extensions / "extensions.json").write_text(
         json.dumps([{"identifier": {"id": "openai.chatgpt"},
                      "relativeLocation": "openai.chatgpt-1"}])
@@ -197,3 +198,73 @@ def test_ensure_follows_active_extension_after_update(tmp_path, monkeypatch, cap
     config_file.write_text(json.dumps(config))
     installer.main()
     assert json.loads(capsys.readouterr().out)['status'] == 'already_configured'
+
+
+@pytest.mark.parametrize('configured', [False, True])
+def test_installer_refuses_nonexecutable_codex_binary(tmp_path, monkeypatch, capsys, configured):
+    installer, base, settings, _ = fixture_installation(tmp_path, monkeypatch)
+    if configured:
+        installer.main()
+        capsys.readouterr()
+    client = Path.home()/'.vscode/extensions/openai.chatgpt-1/bin/linux-x86_64/codex'
+    client.chmod(0o600)
+    before = settings.read_bytes()
+    with pytest.raises(ValueError, match='not executable'):
+        installer.main()
+    assert settings.read_bytes() == before
+    assert len(list((base/'bridge-backups').glob('*'))) == int(configured)
+
+
+PIP_WRAPPERS = [
+    "# -*- coding: utf-8 -*-\nimport re\nimport sys\n"
+    "from process_hud.codex_bridge import main\n"
+    "if __name__ == '__main__':\n"
+    "    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n"
+    "    sys.exit(main())\n",
+    "# -*- coding: utf-8 -*-\nimport sys\n"
+    "from process_hud.codex_bridge import main\n"
+    "if __name__ == '__main__':\n"
+    "    if sys.argv[0].endswith('.exe'):\n"
+    "        sys.argv[0] = sys.argv[0][:-4]\n"
+    "    sys.exit(main())\n",
+]
+
+
+@pytest.mark.parametrize('body', PIP_WRAPPERS)
+def test_ensure_accepts_entry_point_regenerated_by_pip_upgrade(tmp_path, monkeypatch, capsys, body):
+    installer, base, settings, _ = fixture_installation(tmp_path, monkeypatch)
+    installer.main()
+    capsys.readouterr()
+    python = base/'venv/bin/python'
+    # pip may itself have been launched via the equivalent python3 alias.
+    alias = python.with_name('python3')
+    alias.symlink_to(python.name)
+    wrapper = python.with_name('process-hud-codex')
+    wrapper.write_text('#!'+str(alias)+'\n'+body)
+    before = settings.read_bytes(), wrapper.read_bytes()
+    installer.main()
+    assert json.loads(capsys.readouterr().out)['status'] == 'already_configured'
+    assert (settings.read_bytes(), wrapper.read_bytes()) == before
+    assert len(list((base/'bridge-backups').iterdir())) == 1
+
+
+@pytest.mark.parametrize('damage', ['extra-code', 'other-entry-point', 'other-python'])
+def test_ensure_still_rejects_modified_pip_wrappers(tmp_path, monkeypatch, capsys, damage):
+    installer, base, settings, _ = fixture_installation(tmp_path, monkeypatch)
+    installer.main()
+    capsys.readouterr()
+    python = base/'venv/bin/python'
+    wrapper = python.with_name('process-hud-codex')
+    text = '#!'+str(python)+'\n'+PIP_WRAPPERS[0]
+    if damage == 'extra-code':
+        text += 'print("custom hook")\n'
+    elif damage == 'other-entry-point':
+        text = text.replace('process_hud.codex_bridge', 'custom_wrapper')
+    else:
+        text = text.replace(str(python), '/usr/bin/python3', 1)
+    wrapper.write_text(text)
+    before = settings.read_bytes(), wrapper.read_bytes()
+    with pytest.raises(ValueError, match='modified'):
+        installer.main()
+    assert (settings.read_bytes(), wrapper.read_bytes()) == before
+    assert len(list((base/'bridge-backups').iterdir())) == 1

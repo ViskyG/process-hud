@@ -8,7 +8,7 @@ import time
 from PySide6.QtCore import QAbstractListModel, QModelIndex, QPoint, QRect, QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QCursor, QFont, QPainter, QPen, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QListView,
-    QMenu, QPlainTextEdit, QPushButton, QStyledItemDelegate, QStyle, QToolTip, QVBoxLayout, QWidget)
+    QMenu, QPlainTextEdit, QPushButton, QScrollArea, QStyledItemDelegate, QStyle, QToolTip, QVBoxLayout, QWidget)
 from .model import duration, place_details, public_progress, summary
 from .store import Store
 from .util import identity, lock_file
@@ -185,7 +185,20 @@ class Details(GlassWindow):
         self.meta = QLabel(); self.meta.setTextFormat(Qt.TextFormat.PlainText)
         self.meta.setWordWrap(True); self.meta.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.meta.setStyleSheet('font-size: 11px;')
-        lay.addWidget(self.meta)
+        # Producer messages may contain many lines. Keep all of them readable
+        # without letting the label's minimum height push actions off-screen.
+        self.meta_scroll = QScrollArea()
+        self.meta_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.meta_scroll.setWidgetResizable(True)
+        self.meta_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.meta_scroll.setStyleSheet('''QScrollArea { background: transparent; border: 0; }
+            QScrollBar:vertical { background: transparent; width: 4px; }
+            QScrollBar::handle:vertical { background: rgba(255,255,255,55); border-radius: 2px; min-height: 20px; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }''')
+        self.meta_scroll.viewport().setAutoFillBackground(False)
+        self.meta_scroll.setWidget(self.meta)
+        lay.addWidget(self.meta_scroll)
         self.logs = QPlainTextEdit(); self.logs.setReadOnly(True); self.logs.setMaximumBlockCount(1000)
         self.logs.setFont(QFont('Monospace', 9)); self.logs.setMinimumHeight(60)
         lay.addWidget(self.logs, 1)
@@ -201,9 +214,12 @@ class Details(GlassWindow):
         QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self.hide)
 
     def open_task(self, task_id):
+        changed = self.task_id != task_id
         self.task_id = task_id
         self.refresh()
         self.reposition()
+        if changed:
+            self.meta_scroll.verticalScrollBar().setValue(0)
         self.show(); self.raise_()
 
     def reposition(self):
@@ -245,11 +261,22 @@ class Details(GlassWindow):
         elif 'expired' in deliveries:
             parts.append('Срок доставки события Codex истёк; требуется ручная проверка.')
         self.meta.setText('\n'.join(parts))
+        self.fit_metadata()
         log = j['log_tail'] or 'Доступного вывода пока нет.'
         if log != self.logs.toPlainText():
             bar = self.logs.verticalScrollBar(); follow = bar.value() >= bar.maximum()-3
             old = bar.value(); self.logs.setPlainText(log)
             bar.setValue(bar.maximum() if follow else old)
+
+    def fit_metadata(self):
+        if hasattr(self, 'meta_scroll'):
+            width = max(1, self.width()-28)
+            wanted = self.meta.heightForWidth(width)
+            self.meta_scroll.setFixedHeight(min(max(1, wanted), max(40, self.height()//3)))
+
+    def resizeEvent(self, event):
+        self.fit_metadata()
+        super().resizeEvent(event)
 
     def copy_report(self):
         if self.task_id:

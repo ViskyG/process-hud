@@ -102,3 +102,23 @@ def test_technical_gui_exit_preserves_visibility(store, app):
     hud.timer.stop(); hud.quitting = True; hud.close(); app.processEvents()
     assert store.setting('visible') is True
     hud.details.hide(); hud.deleteLater(); app.processEvents()
+
+
+def test_multiline_progress_does_not_push_details_off_screen(store, app):
+    job, _ = store.create('long report', 'external')
+    message = 'line\n'*90
+    store.set_progress(job['id'], {'message': message})
+    hud = Hud(store); hud.timer.stop(); hud.show(); app.processEvents()
+    hud.choose(hud.model.index(0, 0)); app.processEvents()
+    details = hud.details
+    assert message in details.meta.text()
+    assert details.meta_scroll.verticalScrollBar().maximum() > 0
+    assert details.screen().availableGeometry().contains(details.geometry())
+    assert details.rect().contains(details.message.geometry())
+    assert details.rect().contains(details.dismiss.mapTo(details, QPoint(0, 0)))
+    # Going back to a short report releases space to the logs again.
+    old_height = details.meta_scroll.height()
+    store.set_progress(job['id'], {'message': 'done'})
+    details.refresh(); app.processEvents()
+    assert details.meta_scroll.height() < old_height
+    hud.details.hide(); hud.hide(); hud.deleteLater(); app.processEvents()

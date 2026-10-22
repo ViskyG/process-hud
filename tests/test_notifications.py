@@ -1,4 +1,5 @@
 from process_hud import notify
+import json
 
 
 def test_no_notification_when_disabled(store,monkeypatch):
@@ -40,3 +41,19 @@ def test_sound_hint_uses_typed_gnome_notification(store,monkeypatch):
     sent=[c for c in calls if 'org.freedesktop.Notifications.Notify' in c]
     assert len(sent)==1 and any("'sound-name': <'complete'>" in arg for arg in sent[0])
     assert not any(c[0]=='notify-send' for c in calls)
+
+
+def test_dbus_arguments_preserve_quoted_titles_and_option_like_text(store, monkeypatch):
+    store.configure(notify=True, sound=False)
+    job, _ = store.create("'quoted'", 'external')
+    job = store.finish(job['id'], 'succeeded', code=0)
+    calls = []
+    monkeypatch.setattr(notify.shutil, 'which', lambda name: '/bin/'+name)
+    monkeypatch.setattr(notify, 'summary', lambda job: '--help')
+    monkeypatch.setattr(notify, 'tool', lambda args, **kwargs: (calls.append(args) or (0, '', '')))
+    notify.completed(store, job)
+    call = next(c for c in calls if 'org.freedesktop.Notifications.Notify' in c)
+    args = call[call.index('org.freedesktop.Notifications.Notify')+1:]
+    assert args[0] == '--'
+    assert json.loads(args[4]) == "'quoted'"
+    assert json.loads(args[5]) == '--help'

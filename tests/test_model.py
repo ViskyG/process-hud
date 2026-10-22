@@ -71,3 +71,36 @@ def test_explicit_percentage_replaces_old_unit_counter():
     p=progress({}, {'current':20,'total':100},100)
     p=progress(p,{'percent':35},102)
     assert p['percent']==35 and 'current' not in p
+
+
+def test_total_only_update_invalidates_previous_eta():
+    p = progress({}, {'current': 0, 'total': 100}, 100)
+    p = progress(p, {'current': 10}, 102)
+    p = progress(p, {'current': 20}, 104)
+    assert p['eta_seconds'] == 16
+    p = progress(p, {'total': 200}, 106)
+    assert p['percent'] == 10
+    assert p['eta_seconds'] is None and p['rate'] is None
+    assert '_sample' not in p
+    p = progress(p, {'current': 30}, 108)
+    assert p['eta_seconds'] is None
+
+
+@pytest.mark.parametrize('percent', [99, float('nan'), float('inf'), True])
+def test_explicit_percent_must_agree_with_counters(percent):
+    with pytest.raises(ValueError):
+        progress({}, {'current': 25, 'total': 100, 'percent': percent}, 100)
+    assert progress({}, {'current': 25, 'total': 100, 'percent': 25}, 100)['percent'] == 25
+
+
+def test_huge_integer_is_a_validation_error():
+    with pytest.raises(ValueError, match='out of range'):
+        progress({}, {'current': 10**400}, 100)
+
+
+def test_message_preserves_reported_eta_provenance_and_age():
+    p = progress({}, {'percent': 20, 'eta_seconds': 50}, 100)
+    p = progress(p, {'message': 'Still working'}, 102)
+    assert p['eta_source'] == 'reported'
+    assert p['measurement_at'] == 100
+    assert public_progress(p, 131)['eta_seconds'] is None
